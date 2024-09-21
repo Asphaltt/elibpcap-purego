@@ -2,26 +2,29 @@ package elibpcap
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/cilium/ebpf/asm"
 	"github.com/cloudflare/cbpfc"
+	"github.com/ebitengine/purego"
 	"golang.org/x/net/bpf"
 )
-
-/*
-#cgo LDFLAGS: -L/usr/local/lib -lpcap -static
-#include <stdlib.h>
-#include <pcap.h>
-*/
-import "C"
-
-type pcapBpfProgram C.struct_bpf_program
 
 const (
 	MaxBpfInstructions       = 4096
 	bpfInstructionBufferSize = 8 * MaxBpfInstructions
 	MAXIMUM_SNAPLEN          = 262144
+)
+
+const (
+	DLT_EN10MB = 1
+	DLT_RAW    = 12
+
+	PCAP_ERROR = -1
+
+	PCAP_NETMASK_UNKNOWN = 0xffffffff
 )
 
 type StackOffset int
@@ -35,6 +38,60 @@ const (
 	R5Offset
 	AvailableOffset
 )
+
+type pcap_t uintptr
+
+type pcapBpfInsnStruct bpf.RawInstruction
+
+type pcapBpfProgramStruct struct {
+	BfLen   uint32
+	_       uint32
+	BfInsns *pcapBpfInsnStruct
+}
+
+type pcapType uintptr
+
+var (
+	pcap_open_dead func(int, int) pcapType
+	pcap_close     func(pcapType)
+	pcap_geterr    func(pcapType) string
+	pcap_compile   func(pcapType, *pcapBpfProgramStruct, string, int, uint32) int
+	pcap_freecode  func(*pcapBpfProgramStruct)
+)
+
+func findLibpcapSo() string {
+	libpcapSo, _ := filepath.Glob("/usr/lib/x86_64-linux-gnu/libpcap.so*")
+	if len(libpcapSo) != 0 {
+		return libpcapSo[0]
+	}
+
+	return ""
+}
+
+func RegisterLibpcap(libpcapSo string) error {
+	if libpcapSo == "" {
+		libpcapSo = findLibpcapSo()
+	}
+	if libpcapSo == "" {
+		return fmt.Errorf("libpcap.so not found")
+	}
+	if _, err := os.Stat(libpcapSo); err != nil && os.IsNotExist(err) {
+		return fmt.Errorf("libpcap.so not exists: %s", libpcapSo)
+	}
+
+	libpcap, err := purego.Dlopen(libpcapSo, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	if err != nil {
+		return err
+	}
+
+	purego.RegisterLibFunc(&pcap_open_dead, libpcap, "pcap_open_dead")
+	purego.RegisterLibFunc(&pcap_close, libpcap, "pcap_close")
+	purego.RegisterLibFunc(&pcap_geterr, libpcap, "pcap_geterr")
+	purego.RegisterLibFunc(&pcap_compile, libpcap, "pcap_compile")
+	purego.RegisterLibFunc(&pcap_freecode, libpcap, "pcap_freecode")
+
+	return nil
+}
 
 func CompileEbpf(expr string, opts Options) (insts asm.Instructions, err error) {
 	if expr == "__reject_all__" {
@@ -68,32 +125,30 @@ func CompileCbpf(expr string, l2 bool) (insts []bpf.Instruction, err error) {
 		return
 	}
 
-	pcapType := C.DLT_RAW
+	if pcap_open_dead == nil {
+		if err := RegisterLibpcap(""); err != nil {
+			return nil, err
+		}
+	}
+
+	pcapType := DLT_RAW
 	if l2 {
-		pcapType = C.DLT_EN10MB
+		pcapType = DLT_EN10MB
 	}
-	pcap := C.pcap_open_dead(C.int(pcapType), MAXIMUM_SNAPLEN)
-	if pcap == nil {
-		return nil, fmt.Errorf("failed to pcap_open_dead: %+v\n", C.PCAP_ERROR)
+	pcap := pcap_open_dead(pcapType, MAXIMUM_SNAPLEN)
+	if pcap == 0 {
+		return nil, fmt.Errorf("failed to pcap_open_dead: %+v\n", PCAP_ERROR)
 	}
-	defer C.pcap_close(pcap)
+	defer pcap_close(pcap)
 
-	cexpr := C.CString(expr)
-	defer C.free(unsafe.Pointer(cexpr))
-
-	var bpfProg pcapBpfProgram
-	if C.pcap_compile(pcap, (*C.struct_bpf_program)(&bpfProg), cexpr, 1, C.PCAP_NETMASK_UNKNOWN) < 0 {
-		return nil, fmt.Errorf("failed to pcap_compile '%s': %+v", expr, C.GoString(C.pcap_geterr(pcap)))
+	var bpfProg pcapBpfProgramStruct
+	if pcap_compile(pcap, &bpfProg, expr, 1, PCAP_NETMASK_UNKNOWN) < 0 {
+		return nil, fmt.Errorf("failed to pcap_compile '%s': %+v", expr, pcap_geterr(pcap))
 	}
-	defer C.pcap_freecode((*C.struct_bpf_program)(&bpfProg))
+	defer pcap_freecode(&bpfProg)
 
-	for _, v := range (*[bpfInstructionBufferSize]C.struct_bpf_insn)(unsafe.Pointer(bpfProg.bf_insns))[0:bpfProg.bf_len:bpfProg.bf_len] {
-		insts = append(insts, bpf.RawInstruction{
-			Op: uint16(v.code),
-			Jt: uint8(v.jt),
-			Jf: uint8(v.jf),
-			K:  uint32(v.k),
-		}.Disassemble())
+	for _, v := range (*[bpfInstructionBufferSize]pcapBpfInsnStruct)(unsafe.Pointer(bpfProg.BfInsns))[0:bpfProg.BfLen:bpfProg.BfLen] {
+		insts = append(insts, bpf.RawInstruction(v).Disassemble())
 	}
 	return
 }
