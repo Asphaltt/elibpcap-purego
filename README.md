@@ -2,7 +2,7 @@
 
 `elibpcap` is a Go library to inject pcap-filter expressions to bpf prog.
 
-> This is a [purego](github.com/ebitengine/purego) version to call libpcap's C
+> This is a [purego](https://github.com/ebitengine/purego) version to call libpcap's C
 > functions. It is not a wrapper of libpcap.
 >
 > Then, with `purego`, it is possible to build without CGO.
